@@ -3,12 +3,20 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import spawn, { SubprocessError } from "nano-spawn";
 import { readFile } from "node:fs/promises";
+import { createWriteStream } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
+// Live per-call logs so a call in progress can be watched in a second terminal
+// (`Get-Content -Wait <file>` / `tail -f <file>`) instead of only seeing the
+// result once the whole call finishes — useful for slow calls and essential
+// for telling concurrent lanes' output apart.
+const LOG_DIR = path.join(os.tmpdir(), "agent-bridge-logs");
+
 // nano-spawn resolves .cmd/.bat shims on Windows internally (no shell:true
 // needed), so LLM-generated prompt text never gets re-parsed by cmd.exe.
-async function runCli(command, args, { cwd, timeoutMs } = {}) {
+async function runCli(command, args, { cwd, timeoutMs, logLabel } = {}) {
   const controller = new AbortController();
   let timedOut = false;
   const timer = timeoutMs
@@ -18,24 +26,55 @@ async function runCli(command, args, { cwd, timeoutMs } = {}) {
       }, timeoutMs)
     : null;
 
+  await mkdir(LOG_DIR, { recursive: true });
+  const logFile = path.join(LOG_DIR, `${logLabel ?? command}-${Date.now()}-${process.pid}.log`);
+  const logStream = createWriteStream(logFile, { flags: "a" });
+  logStream.write(`$ ${command} ${args.join(" ")}\n${cwd ? `cwd: ${cwd}\n` : ""}\n`);
+
+  // stdio: give the child an already-closed stdin. Both codex and opencode
+  // will otherwise block waiting for stdin EOF even when a prompt is passed
+  // as an argument (codex appends piped stdin as an extra <stdin> block).
+  const subprocess = spawn(command, args, { cwd, signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
+
+  // Consuming subprocess.stdout/.stderr as async iterables drains them, so the
+  // Result/SubprocessError's own .stdout/.stderr come back empty afterward —
+  // these accumulated buffers are the real source of truth from here on.
+  let stdoutBuf = "";
+  let stderrBuf = "";
+  const teeStdout = (async () => {
+    for await (const line of subprocess.stdout) {
+      stdoutBuf += line + "\n";
+      logStream.write(`[stdout] ${line}\n`);
+    }
+  })();
+  const teeStderr = (async () => {
+    for await (const line of subprocess.stderr) {
+      stderrBuf += line + "\n";
+      logStream.write(`[stderr] ${line}\n`);
+    }
+  })();
+
   try {
-    // stdio: give the child an already-closed stdin. Both codex and opencode
-    // will otherwise block waiting for stdin EOF even when a prompt is passed
-    // as an argument (codex appends piped stdin as an extra <stdin> block).
-    const result = await spawn(command, args, { cwd, signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
-    return { ok: true, code: 0, stdout: result.stdout, stderr: result.stderr, timedOut: false, spawnError: null };
+    await subprocess;
+    await Promise.allSettled([teeStdout, teeStderr]);
+    logStream.end("\n[done] exit 0\n");
+    return { ok: true, code: 0, stdout: stdoutBuf, stderr: stderrBuf, timedOut: false, spawnError: null, logFile };
   } catch (err) {
+    await Promise.allSettled([teeStdout, teeStderr]);
     if (err instanceof SubprocessError) {
+      logStream.end(`\n[failed] exit ${err.exitCode ?? "?"}${timedOut ? " (timed out)" : ""}\n`);
       return {
         ok: false,
         code: err.exitCode ?? null,
-        stdout: err.stdout ?? "",
-        stderr: err.stderr ?? "",
+        stdout: stdoutBuf,
+        stderr: stderrBuf,
         timedOut,
         spawnError: timedOut ? null : err.cause?.message ?? err.message,
+        logFile,
       };
     }
-    return { ok: false, code: null, stdout: "", stderr: "", timedOut, spawnError: err.message };
+    logStream.end(`\n[spawn error] ${err.message}\n`);
+    return { ok: false, code: null, stdout: stdoutBuf, stderr: stderrBuf, timedOut, spawnError: err.message, logFile };
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -147,7 +186,7 @@ async function delegateToCodex({ prompt, cwd, sandbox, model, session_id, fork, 
     if (cwd) args.push("-C", cwd);
   }
 
-  const result = await runCli("codex", args, { cwd, timeoutMs: effectiveTimeout });
+  const result = await runCli("codex", args, { cwd, timeoutMs: effectiveTimeout, logLabel: "codex" });
   const events = parseJsonLines(result.stdout);
   const parsed = extractCodexResult(events);
 
@@ -162,6 +201,7 @@ async function delegateToCodex({ prompt, cwd, sandbox, model, session_id, fork, 
     exit_code: result.code ?? null,
     spawn_error: result.spawnError ?? null,
     stderr_tail: result.stderr ? result.stderr.slice(-2000) : "",
+    log_file: result.logFile,
   };
 }
 
@@ -181,7 +221,7 @@ async function delegateToOpencode({ message, cwd, model, agent, session_id, fork
   if (cwd) args.push("--dir", cwd);
   if (autoApprove) args.push("--auto");
 
-  const result = await runCli("opencode", args, { cwd, timeoutMs: effectiveTimeout });
+  const result = await runCli("opencode", args, { cwd, timeoutMs: effectiveTimeout, logLabel: "opencode" });
   const events = parseJsonLines(result.stdout);
   const parsed = extractOpencodeResult(events);
 
@@ -195,6 +235,7 @@ async function delegateToOpencode({ message, cwd, model, agent, session_id, fork
     exit_code: result.code ?? null,
     spawn_error: result.spawnError ?? null,
     stderr_tail: result.stderr ? result.stderr.slice(-2000) : "",
+    log_file: result.logFile,
   };
 }
 
@@ -213,7 +254,10 @@ server.registerTool(
       "subcommands don't accept them, so a continued thread keeps whatever sandbox/cwd it was created with. " +
       "sandbox defaults to 'read-only' (Codex can read files and run read-only shell commands but cannot " +
       "write anything) — pass 'workspace-write' when the task requires Codex to actually edit files under cwd. " +
-      "Never silently escalates to unsandboxed execution; danger-full-access must be requested explicitly.",
+      "Never silently escalates to unsandboxed execution; danger-full-access must be requested explicitly. " +
+      "The response includes log_file: a path this call's raw stdout/stderr was streamed to live as Codex " +
+      "ran, so the user can tail it in another terminal (`Get-Content -Wait <path>` / `tail -f <path>`) to " +
+      "watch a slow or concurrent call happen in real time instead of waiting for the final result.",
     inputSchema: {
       prompt: z.string().describe("The task or instructions to send to Codex"),
       cwd: z.string().optional().describe("Working directory Codex should treat as its workspace root"),
@@ -278,7 +322,9 @@ server.registerTool(
       "into a new session instead of continuing in place. auto_approve maps to OpenCode's --auto flag " +
       "(auto-approves any permission that isn't explicitly denied) and defaults to false; only set it true if " +
       "the task needs a tool permission that would otherwise hang or fail waiting on an interactive approval " +
-      "that can never arrive here.",
+      "that can never arrive here. The response includes log_file: a path this call's raw stdout/stderr was " +
+      "streamed to live as OpenCode ran, so the user can tail it in another terminal " +
+      "(`Get-Content -Wait <path>` / `tail -f <path>`) to watch it happen in real time.",
     inputSchema: {
       message: z.string().describe("The task or instructions to send to OpenCode"),
       cwd: z.string().optional().describe("Directory to run OpenCode in"),
@@ -378,7 +424,9 @@ server.registerTool(
       "independent agents with write access against the same files would race them against each other (this " +
       "matters especially if cwd is a lane a 'lanes' split assigned exclusively to one worker — never point " +
       "this tool at a lane's files expecting it to do that lane's actual edit; use codex_delegate directly for " +
-      "that). For a task that needs real edits, follow up with codex_delegate or opencode_delegate directly.",
+      "that). For a task that needs real edits, follow up with codex_delegate or opencode_delegate directly. " +
+      "Each side's result includes its own log_file (codex.log_file / opencode.log_file) with that call's " +
+      "raw live output, so both can be tailed side by side in separate terminals while they run.",
     inputSchema: {
       prompt: z.string().describe("The task or question to send to both Codex and OpenCode"),
       cwd: z.string().optional().describe("Working directory both agents should read from"),

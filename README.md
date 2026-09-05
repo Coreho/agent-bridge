@@ -34,6 +34,20 @@ Or for local development:
 claude --plugin-dir /path/to/agent-bridge
 ```
 
+## Watching a delegated call live
+
+Every `codex_delegate`/`opencode_delegate`/`compare_agents` result includes a `log_file` path. Each call's raw stdout/stderr is streamed to that file in real time as the delegated CLI runs (not just returned at the end), so you can open a second terminal and watch it happen:
+
+```
+# PowerShell
+Get-Content -Wait <log_file>
+
+# bash
+tail -f <log_file>
+```
+
+Logs live under `%TEMP%\agent-bridge-logs\` (one file per call, so concurrent lanes each get their own).
+
 ## Security notes
 
 - `codex_delegate` defaults to `sandbox: "read-only"` and `opencode_delegate` defaults to `auto_approve: false`. Both delegated CLIs run non-interactively as child processes of Claude Code with whatever filesystem/shell access their sandbox setting allows — treat write-enabled or full-access modes the same as you would any other command Claude runs on your machine.

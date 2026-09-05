@@ -32,4 +32,6 @@ Both calls accept `cwd` to scope where the delegated agent operates, and `timeou
 3. Read `text` for the answer. Check `ok`, `warnings`/`stderr_tail`, and `timed_out` before trusting the result — a false `ok` or non-empty `warnings` means something went wrong and the text may be partial or absent.
 4. If you need to follow up, call again with the same `session_id`.
 
+Every result also includes `log_file` — that call's raw stdout/stderr streamed live to disk as the delegated CLI ran (for `compare_agents`, this is nested under `codex.log_file` / `opencode.log_file`). If the user wants to watch a delegated call happen instead of just seeing the final answer, tell them this path and that they can `tail -f`/`Get-Content -Wait` it in another terminal while it runs — this is especially useful for a slow call or several concurrent lane calls, since each gets its own file.
+
 Report back to the user which agent/model actually produced the answer — don't present a delegated agent's output as your own.
