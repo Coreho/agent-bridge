@@ -1,6 +1,6 @@
 {
   "name": "agent-bridge",
-  "description": "Delegate coding tasks to other CLI coding agents (Codex, OpenCode) and manage multi-turn sessions with them from inside Claude Code",
-  "version": "0.1.0",
+  "description": "Delegate coding tasks to other locally-installed CLI coding agents (Codex, OpenCode, Qwen Code, Kilo Code, Antigravity) and manage multi-turn sessions with them from inside Claude Code",
+  "version": "0.2.0",
   "author": { "name": "koreo" }
 }

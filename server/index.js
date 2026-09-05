@@ -31,9 +31,9 @@ async function runCli(command, args, { cwd, timeoutMs, logLabel } = {}) {
   const logStream = createWriteStream(logFile, { flags: "a" });
   logStream.write(`$ ${command} ${args.join(" ")}\n${cwd ? `cwd: ${cwd}\n` : ""}\n`);
 
-  // stdio: give the child an already-closed stdin. Both codex and opencode
-  // will otherwise block waiting for stdin EOF even when a prompt is passed
-  // as an argument (codex appends piped stdin as an extra <stdin> block).
+  // stdio: give the child an already-closed stdin. Several of these CLIs
+  // (codex, opencode) block waiting for stdin EOF even when a prompt is
+  // passed as an argument — closing stdin up front avoids that hang.
   const subprocess = spawn(command, args, { cwd, signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
 
   // Consuming subprocess.stdout/.stderr as async iterables drains them, so the
@@ -94,13 +94,30 @@ function parseJsonLines(text) {
   return events;
 }
 
-function extractCodexResult(events) {
-  let threadId = null;
+// ---------------------------------------------------------------------------
+// Adapter registry. Each adapter knows how to run ONE cli non-interactively.
+// Adding support for a new CLI coding agent means adding one entry here —
+// the generic tools below (list_available_clis / agent_delegate /
+// agent_list_sessions) never need to change.
+//
+// Adapter shape:
+//   id, label, bin
+//   checkAvailable()                         -> Promise<boolean>
+//   buildRun({ prompt, cwd, permission, model, session_id, fork })
+//                                             -> { args, warnings }
+//   extractResult(stdout)                    -> { sessionId, text, warnings, usage }
+//   listSessions(max_count)                  -> Promise<{ sessions, warning }> | null if unsupported
+//   permissions: array of accepted `permission` values, first is the default
+// ---------------------------------------------------------------------------
+
+function extractCodexEvents(stdout) {
+  const events = parseJsonLines(stdout);
+  let sessionId = null;
   let text = "";
   const warnings = [];
   let usage = null;
   for (const ev of events) {
-    if (ev.type === "thread.started") threadId = ev.thread_id;
+    if (ev.type === "thread.started") sessionId = ev.thread_id;
     if (ev.type === "item.completed" && ev.item) {
       if (ev.item.type === "agent_message" && typeof ev.item.text === "string") text += ev.item.text;
       else if (ev.item.type === "error") warnings.push(ev.item.message);
@@ -108,21 +125,60 @@ function extractCodexResult(events) {
     if (ev.type === "turn.completed") usage = ev.usage ?? usage;
     if (ev.type === "turn.failed") warnings.push(JSON.stringify(ev.error ?? ev));
   }
-  return { threadId, text, warnings, usage };
+  return { sessionId, text, warnings, usage };
 }
 
-function extractOpencodeResult(events) {
+function extractOpencodeEvents(stdout) {
+  const events = parseJsonLines(stdout);
   let sessionId = null;
   let text = "";
+  const warnings = [];
   let usage = null;
   for (const ev of events) {
     if (ev.sessionID) sessionId = ev.sessionID;
     if (ev.type === "text" && ev.part?.text) text += ev.part.text;
+    if (ev.type === "error" && ev.error) warnings.push(ev.error.message ?? JSON.stringify(ev.error));
     if (ev.type === "step_finish" && ev.part) {
       usage = { tokens: ev.part.tokens ?? null, cost: ev.part.cost ?? null };
     }
   }
-  return { sessionId, text, usage };
+  return { sessionId, text, warnings, usage };
+}
+
+// Qwen Code's --output-format stream-json is JSONL of message events, the last
+// of which is `{type:"result", subtype:"success"|..., result, session_id, usage}`.
+function extractQwenEvents(stdout) {
+  const events = parseJsonLines(stdout);
+  let sessionId = null;
+  let text = "";
+  const warnings = [];
+  let usage = null;
+  for (const ev of events) {
+    if (ev.session_id) sessionId = ev.session_id;
+    if (ev.type === "result") {
+      if (!ev.is_error && typeof ev.result === "string") text += ev.result;
+      else if (ev.is_error) warnings.push(ev.error?.message ?? JSON.stringify(ev));
+      usage = ev.usage ?? usage;
+    }
+  }
+  return { sessionId, text, warnings, usage };
+}
+
+// Antigravity's --output-format json prints a single envelope (not NDJSON),
+// but it's exactly one line so the existing line-based parser still works.
+function extractAntigravityEvents(stdout) {
+  const events = parseJsonLines(stdout);
+  let sessionId = null;
+  let text = "";
+  const warnings = [];
+  let usage = null;
+  for (const ev of events) {
+    if (ev.conversation_id) sessionId = ev.conversation_id;
+    if (typeof ev.response === "string") text += ev.response;
+    if (ev.status && ev.status !== "SUCCESS") warnings.push(ev.error ? JSON.stringify(ev.error) : `status: ${ev.status}`);
+    if (ev.usage) usage = ev.usage;
+  }
+  return { sessionId, text, warnings, usage };
 }
 
 // Codex has no non-interactive session-list command (`codex agents`/`resume --all`
@@ -131,7 +187,7 @@ function extractOpencodeResult(events) {
 // so we fold it by id, keeping the last (most recent) entry per id. This is an
 // undocumented internal file; if a future Codex version changes its shape or
 // location, this degrades to an empty list with a warning rather than throwing.
-async function readCodexSessionIndex() {
+async function listCodexSessions(max_count) {
   const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
   const indexPath = path.join(codexHome, "session_index.jsonl");
 
@@ -156,289 +212,346 @@ async function readCodexSessionIndex() {
 
   const sessions = [...byId.values()]
     .map((e) => ({ id: e.id, title: e.thread_name ?? null, updated_at: e.updated_at ?? null }))
-    .sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? ""));
+    .sort((a, b) => (b.updated_at ?? "").localeCompare(a.updated_at ?? ""))
+    .slice(0, max_count ?? 20);
 
   return { sessions, warning: null };
 }
 
-// Shared core so codex_delegate and compare_agents run identical logic —
-// compare_agents' safety guarantee (always read-only) depends on this being
-// the only path that talks to the codex CLI.
-async function delegateToCodex({ prompt, cwd, sandbox, model, session_id, fork, timeoutMs }) {
-  const effectiveTimeout = timeoutMs ?? 300000;
-  const warnings = [];
-
-  const args = ["exec"];
-  if (session_id) {
-    args.push(fork ? "fork" : "resume", session_id, prompt);
-    args.push("--json", "--skip-git-repo-check");
-    if (model) args.push("--model", model);
-    if (sandbox || cwd) {
-      warnings.push(
-        "sandbox/cwd are ignored when continuing via session_id (codex exec resume/fork don't accept them); " +
-          "the thread keeps whatever sandbox/cwd it was created with."
-      );
-    }
-  } else {
-    args.push(prompt);
-    args.push("--json", "--skip-git-repo-check", "--sandbox", sandbox ?? "read-only");
-    if (model) args.push("--model", model);
-    if (cwd) args.push("-C", cwd);
-  }
-
-  const result = await runCli("codex", args, { cwd, timeoutMs: effectiveTimeout, logLabel: "codex" });
-  const events = parseJsonLines(result.stdout);
-  const parsed = extractCodexResult(events);
-
-  return {
-    ok: result.ok && parsed.text.length > 0,
-    session_id: parsed.threadId ?? session_id ?? null,
-    text: parsed.text,
-    warnings: [...warnings, ...parsed.warnings],
-    usage: parsed.usage,
-    sandbox: session_id ? null : sandbox ?? "read-only",
-    timed_out: result.timedOut,
-    exit_code: result.code ?? null,
-    spawn_error: result.spawnError ?? null,
-    stderr_tail: result.stderr ? result.stderr.slice(-2000) : "",
-    log_file: result.logFile,
-  };
-}
-
-// Shared core so opencode_delegate and compare_agents run identical logic —
-// compare_agents' safety guarantee (auto_approve always off) depends on this
-// being the only path that talks to the opencode CLI.
-async function delegateToOpencode({ message, cwd, model, agent, session_id, fork, autoApprove, timeoutMs }) {
-  const effectiveTimeout = timeoutMs ?? 300000;
-
-  const args = ["run", message, "--format", "json"];
-  if (session_id) {
-    args.push("--session", session_id);
-    if (fork) args.push("--fork");
-  }
-  if (model) args.push("--model", model);
-  if (agent) args.push("--agent", agent);
-  if (cwd) args.push("--dir", cwd);
-  if (autoApprove) args.push("--auto");
-
-  const result = await runCli("opencode", args, { cwd, timeoutMs: effectiveTimeout, logLabel: "opencode" });
-  const events = parseJsonLines(result.stdout);
-  const parsed = extractOpencodeResult(events);
-
-  return {
-    ok: result.ok && parsed.text.length > 0,
-    session_id: parsed.sessionId ?? session_id ?? null,
-    text: parsed.text,
-    usage: parsed.usage,
-    auto_approve: !!autoApprove,
-    timed_out: result.timedOut,
-    exit_code: result.code ?? null,
-    spawn_error: result.spawnError ?? null,
-    stderr_tail: result.stderr ? result.stderr.slice(-2000) : "",
-    log_file: result.logFile,
-  };
-}
-
-const server = new McpServer({ name: "agent-bridge", version: "0.1.0" });
-
-server.registerTool(
-  "codex_delegate",
-  {
-    title: "Delegate a task to Codex CLI",
-    description:
-      "Run OpenAI's `codex` CLI non-interactively on a coding task and return its final answer as text. " +
-      "Codex keeps its own conversation state: pass session_id (the thread_id returned from a prior " +
-      "codex_delegate call) to continue that exact conversation with full prior context, or set fork:true " +
-      "alongside it to branch a new thread off that point instead of continuing in place. " +
-      "sandbox and cwd only take effect when starting a NEW thread (no session_id) — Codex's resume/fork " +
-      "subcommands don't accept them, so a continued thread keeps whatever sandbox/cwd it was created with. " +
-      "sandbox defaults to 'read-only' (Codex can read files and run read-only shell commands but cannot " +
-      "write anything) — pass 'workspace-write' when the task requires Codex to actually edit files under cwd. " +
-      "Never silently escalates to unsandboxed execution; danger-full-access must be requested explicitly. " +
-      "The response includes log_file: a path this call's raw stdout/stderr was streamed to live as Codex " +
-      "ran, so the user can tail it in another terminal (`Get-Content -Wait <path>` / `tail -f <path>`) to " +
-      "watch a slow or concurrent call happen in real time instead of waiting for the final result.",
-    inputSchema: {
-      prompt: z.string().describe("The task or instructions to send to Codex"),
-      cwd: z.string().optional().describe("Working directory Codex should treat as its workspace root"),
-      sandbox: z
-        .enum(["read-only", "workspace-write", "danger-full-access"])
-        .optional()
-        .describe("Sandbox policy for shell commands Codex runs. Default: read-only"),
-      model: z.string().optional().describe("Override model, e.g. 'gpt-5.1-codex'"),
-      session_id: z
-        .string()
-        .optional()
-        .describe("thread_id from a previous codex_delegate call, to continue that conversation"),
-      fork: z
-        .boolean()
-        .optional()
-        .describe("If session_id is set, fork into a new thread instead of resuming in place. Default: false"),
-      timeout_ms: z.number().optional().describe("Kill Codex if it runs longer than this. Default: 300000 (5 min)"),
-    },
-  },
-  async ({ prompt, cwd, sandbox, model, session_id, fork, timeout_ms }) => {
-    const payload = await delegateToCodex({ prompt, cwd, sandbox, model, session_id, fork, timeoutMs: timeout_ms });
-    return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
-  }
-);
-
-server.registerTool(
-  "codex_list_sessions",
-  {
-    title: "List Codex sessions",
-    description:
-      "List Codex thread ids and their auto-generated titles, most recently updated first — including " +
-      "threads created outside this plugin (e.g. from interactive `codex` use). Use this to find the right " +
-      "session_id for codex_delegate when it isn't already in this conversation (e.g. after compaction, or " +
-      "in a fresh conversation). Reads Codex's own session index file directly since Codex has no " +
-      "non-interactive list command; if that file is missing or unreadable this returns an empty list with " +
-      "a warning instead of failing. Does not include cwd — Codex's index doesn't track it.",
-    inputSchema: {
-      max_count: z.number().optional().describe("Max sessions to return. Default: 20"),
-    },
-  },
-  async ({ max_count }) => {
-    const { sessions, warning } = await readCodexSessionIndex();
-    const limited = sessions.slice(0, max_count ?? 20);
-    const payload = {
-      ok: warning === null,
-      sessions: limited,
-      count: limited.length,
-      warning,
-    };
-    return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
-  }
-);
-
-server.registerTool(
-  "opencode_delegate",
-  {
-    title: "Delegate a task to OpenCode CLI",
-    description:
-      "Run the `opencode` CLI non-interactively on a coding task and return its final answer as text. " +
-      "OpenCode keeps its own session state: pass session_id (the sessionID returned from a prior " +
-      "opencode_delegate call) to continue that exact conversation, or set fork:true alongside it to branch " +
-      "into a new session instead of continuing in place. auto_approve maps to OpenCode's --auto flag " +
-      "(auto-approves any permission that isn't explicitly denied) and defaults to false; only set it true if " +
-      "the task needs a tool permission that would otherwise hang or fail waiting on an interactive approval " +
-      "that can never arrive here. The response includes log_file: a path this call's raw stdout/stderr was " +
-      "streamed to live as OpenCode ran, so the user can tail it in another terminal " +
-      "(`Get-Content -Wait <path>` / `tail -f <path>`) to watch it happen in real time.",
-    inputSchema: {
-      message: z.string().describe("The task or instructions to send to OpenCode"),
-      cwd: z.string().optional().describe("Directory to run OpenCode in"),
-      model: z.string().optional().describe("provider/model, e.g. 'anthropic/claude-sonnet-5'"),
-      agent: z.string().optional().describe("Named OpenCode agent to use"),
-      session_id: z
-        .string()
-        .optional()
-        .describe("sessionID from a previous opencode_delegate call, to continue that conversation"),
-      fork: z
-        .boolean()
-        .optional()
-        .describe("If session_id is set, fork into a new session instead of continuing in place. Default: false"),
-      auto_approve: z
-        .boolean()
-        .optional()
-        .describe("Auto-approve OpenCode permission prompts that aren't explicitly denied. Default: false"),
-      timeout_ms: z.number().optional().describe("Kill OpenCode if it runs longer than this. Default: 300000 (5 min)"),
-    },
-  },
-  async ({ message, cwd, model, agent, session_id, fork, auto_approve, timeout_ms }) => {
-    const payload = await delegateToOpencode({
-      message,
-      cwd,
-      model,
-      agent,
-      session_id,
-      fork,
-      autoApprove: auto_approve,
-      timeoutMs: timeout_ms,
-    });
-    return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
-  }
-);
-
-server.registerTool(
-  "opencode_list_sessions",
-  {
-    title: "List OpenCode sessions",
-    description:
-      "List OpenCode session ids, titles (auto-generated from each session's first message), and working " +
-      "directories, most recently updated first — including sessions created outside this plugin. Use this " +
-      "to find the right session_id for opencode_delegate when it isn't already in this conversation. " +
-      "Optionally filter to sessions whose directory contains cwd_contains.",
-    inputSchema: {
-      max_count: z.number().optional().describe("Max sessions to return. Default: 20"),
-      cwd_contains: z.string().optional().describe("Only return sessions whose directory includes this substring"),
-    },
-  },
-  async ({ max_count, cwd_contains }) => {
-    const result = await runCli("opencode", ["session", "list", "--format", "json", "--max-count", String(max_count ?? 20)]);
-
+// Shared by opencode and kilo (kilo's CLI is a direct fork of opencode's, same
+// `session list --format json` shape).
+function makeOpencodeStyleSessionLister(bin) {
+  return async function listSessions(max_count) {
+    const result = await runCli(bin, ["session", "list", "--format", "json", "--max-count", String(max_count ?? 20)]);
     if (!result.ok) {
-      const payload = {
-        ok: false,
-        sessions: [],
-        count: 0,
-        exit_code: result.code ?? null,
-        spawn_error: result.spawnError ?? null,
-        stderr_tail: result.stderr ? result.stderr.slice(-2000) : "",
-      };
-      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+      return { sessions: [], warning: result.spawnError ?? `${bin} session list exited ${result.code}` };
     }
-
+    if (!result.stdout.trim()) {
+      return { sessions: [], warning: null }; // no sessions yet — prints nothing rather than "[]"
+    }
     let raw;
     try {
       raw = JSON.parse(result.stdout);
     } catch (err) {
-      const payload = { ok: false, sessions: [], count: 0, spawn_error: `Failed to parse session list JSON: ${err.message}` };
-      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+      return { sessions: [], warning: `Failed to parse session list JSON: ${err.message}` };
     }
-
-    let sessions = raw.map((s) => ({
+    const sessions = raw.map((s) => ({
       id: s.id,
       title: s.title ?? null,
       cwd: s.directory ?? null,
       created_at: s.created ? new Date(s.created).toISOString() : null,
       updated_at: s.updated ? new Date(s.updated).toISOString() : null,
     }));
-    if (cwd_contains) sessions = sessions.filter((s) => s.cwd?.includes(cwd_contains));
+    return { sessions, warning: null };
+  };
+}
+const listOpencodeSessions = makeOpencodeStyleSessionLister("opencode");
+const listKiloSessions = makeOpencodeStyleSessionLister("kilo");
 
-    const payload = { ok: true, sessions, count: sessions.length };
+// qwen's `sessions list --json` prints JSONL (one transcript-summary object
+// per line), not a JSON array — parseJsonLines already treats empty stdout
+// (no sessions yet) as an empty list with no special-casing needed.
+async function listQwenSessions(max_count) {
+  const result = await runCli("qwen", ["sessions", "list", "--limit", String(max_count ?? 20), "--json"]);
+  if (!result.ok) {
+    return { sessions: [], warning: result.spawnError ?? `qwen sessions list exited ${result.code}` };
+  }
+  const raw = parseJsonLines(result.stdout);
+  const sessions = raw.map((s) => ({
+    id: s.sessionId ?? null,
+    title: s.customTitle ?? s.prompt ?? null,
+    cwd: s.cwd ?? null,
+    created_at: s.startTime ?? null,
+    updated_at: s.mtime ?? null,
+  }));
+  return { sessions, warning: null };
+}
+
+const ADAPTERS = {
+  codex: {
+    id: "codex",
+    label: "Codex CLI",
+    bin: "codex",
+    permissions: ["read-only", "workspace-write", "danger-full-access"],
+    async checkAvailable() {
+      const r = await runCli("codex", ["--version"], { timeoutMs: 10000, logLabel: "codex-check" });
+      return r.ok;
+    },
+    buildRun({ prompt, cwd, permission, model, session_id, fork }) {
+      const warnings = [];
+      const args = ["exec"];
+      if (session_id) {
+        args.push(fork ? "fork" : "resume", session_id, prompt, "--json", "--skip-git-repo-check");
+        if (model) args.push("--model", model);
+        if (permission || cwd) {
+          warnings.push(
+            "permission/cwd are ignored when continuing via session_id (codex exec resume/fork don't accept " +
+              "them); the thread keeps whatever sandbox/cwd it was created with."
+          );
+        }
+      } else {
+        args.push(prompt, "--json", "--skip-git-repo-check", "--sandbox", permission ?? "read-only");
+        if (model) args.push("--model", model);
+        if (cwd) args.push("-C", cwd);
+      }
+      return { args, warnings };
+    },
+    extractResult: extractCodexEvents,
+    listSessions: listCodexSessions,
+  },
+  opencode: {
+    id: "opencode",
+    label: "OpenCode CLI",
+    bin: "opencode",
+    permissions: ["read-only", "workspace-write"],
+    async checkAvailable() {
+      const r = await runCli("opencode", ["--version"], { timeoutMs: 10000, logLabel: "opencode-check" });
+      return r.ok;
+    },
+    buildRun({ prompt, cwd, permission, model, agent, session_id, fork }) {
+      const args = ["run", prompt, "--format", "json"];
+      if (session_id) {
+        args.push("--session", session_id);
+        if (fork) args.push("--fork");
+      }
+      if (model) args.push("--model", model);
+      if (agent) args.push("--agent", agent);
+      if (cwd) args.push("--dir", cwd);
+      if (permission === "workspace-write") args.push("--auto");
+      return { args, warnings: [] };
+    },
+    extractResult: extractOpencodeEvents,
+    listSessions: listOpencodeSessions,
+  },
+  qwen: {
+    id: "qwen",
+    label: "Qwen Code CLI",
+    bin: "qwen",
+    permissions: ["read-only", "workspace-write", "danger-full-access"],
+    async checkAvailable() {
+      const r = await runCli("qwen", ["--version"], { timeoutMs: 10000, logLabel: "qwen-check" });
+      return r.ok;
+    },
+    buildRun({ prompt, cwd, permission, model, fork, session_id }) {
+      const warnings = [];
+      // approval-mode maps loosely to Codex's three-tier sandbox concept: plan
+      // (won't act) / auto-edit (can write files) / yolo (approve everything).
+      const approvalMap = { "read-only": "plan", "workspace-write": "auto-edit", "danger-full-access": "yolo" };
+      const args = ["-p", prompt, "--output-format", "stream-json", "--approval-mode", approvalMap[permission ?? "read-only"] ?? "plan"];
+      if (session_id) {
+        args.push("--resume", session_id);
+        if (fork) warnings.push("fork is not confirmed supported for qwen; resuming in place instead.");
+      }
+      if (model) warnings.push("model override is not confirmed supported for qwen; ignored.");
+      return { args, warnings };
+    },
+    extractResult: extractQwenEvents,
+    listSessions: listQwenSessions,
+  },
+  // Note: observed hanging (never exiting) after a provider auth error rather
+  // than failing fast like the others — the timeout reclaims it correctly,
+  // but expect auth failures here to surface only once timeout_ms elapses.
+  kilo: {
+    id: "kilo",
+    label: "Kilo Code CLI",
+    bin: "kilo",
+    permissions: ["read-only", "workspace-write"],
+    async checkAvailable() {
+      const r = await runCli("kilo", ["--version"], { timeoutMs: 10000, logLabel: "kilo-check" });
+      return r.ok;
+    },
+    buildRun({ prompt, cwd, permission, model, agent, session_id, fork }) {
+      const warnings = [];
+      const args = ["run", prompt, "--format", "json"];
+      if (session_id) {
+        args.push("--session", session_id);
+        if (fork) args.push("--fork");
+      }
+      if (permission === "workspace-write") args.push("--auto");
+      if (model) warnings.push("model override is not confirmed supported for kilo; ignored.");
+      if (agent) warnings.push("agent is not confirmed supported for kilo; ignored.");
+      return { args, warnings };
+    },
+    extractResult: extractOpencodeEvents, // kilo's CLI is a direct fork of opencode's — identical event shape
+    listSessions: listKiloSessions,
+  },
+  antigravity: {
+    id: "antigravity",
+    label: "Antigravity CLI (agy)",
+    bin: "agy",
+    permissions: ["read-only", "workspace-write", "danger-full-access"],
+    async checkAvailable() {
+      const r = await runCli("agy", ["--version"], { timeoutMs: 10000, logLabel: "antigravity-check" });
+      return r.ok;
+    },
+    buildRun({ prompt, cwd, permission, model, session_id, fork }) {
+      const warnings = [];
+      const args = ["-p", prompt, "--output-format", "json"];
+      if (session_id) {
+        args.push("--conversation", session_id);
+        if (fork) warnings.push("fork is not confirmed supported for antigravity; continuing the existing conversation instead.");
+        if (permission) warnings.push("permission is ignored when continuing via session_id for antigravity (unconfirmed whether resume accepts mode/sandbox flags, so they're not sent).");
+      } else if (permission === "danger-full-access") {
+        args.push("--dangerously-skip-permissions");
+      } else {
+        const modeMap = { "read-only": "plan", "workspace-write": "accept-edits" };
+        args.push(`--mode=${modeMap[permission ?? "read-only"] ?? "plan"}`);
+        args.push("--sandbox");
+      }
+      if (model) warnings.push("model override is not confirmed supported for antigravity; ignored.");
+      return { args, warnings };
+    },
+    extractResult: extractAntigravityEvents,
+    // No real non-interactive session history exists for antigravity — only a
+    // last-conversation-per-workspace cache file, not a log. Left unsupported
+    // rather than guessing that file's exact shape.
+    listSessions: null,
+  },
+};
+
+// Shared core so every CLI's delegate call and every safety guarantee (default
+// read-only permission, warnings on dropped flags) runs through identical logic.
+async function delegateTo(adapter, { prompt, cwd, permission, model, agent, session_id, fork, timeoutMs }) {
+  const effectiveTimeout = timeoutMs ?? 300000;
+  const { args, warnings } = adapter.buildRun({ prompt, cwd, permission, model, agent, session_id, fork });
+  const result = await runCli(adapter.bin, args, { cwd, timeoutMs: effectiveTimeout, logLabel: adapter.id });
+  const parsed = adapter.extractResult(result.stdout);
+
+  return {
+    ok: result.ok && parsed.text.length > 0,
+    cli: adapter.id,
+    session_id: parsed.sessionId ?? session_id ?? null,
+    text: parsed.text,
+    warnings: [...warnings, ...parsed.warnings],
+    usage: parsed.usage,
+    permission: session_id ? null : permission ?? adapter.permissions[0],
+    timed_out: result.timedOut,
+    exit_code: result.code ?? null,
+    spawn_error: result.spawnError ?? null,
+    stderr_tail: result.stderr ? result.stderr.slice(-2000) : "",
+    log_file: result.logFile,
+  };
+}
+
+const server = new McpServer({ name: "agent-bridge", version: "0.2.0" });
+
+server.registerTool(
+  "list_available_clis",
+  {
+    title: "Detect which CLI coding agents are installed",
+    description:
+      "Probe every CLI coding agent this plugin knows how to drive (currently: codex, opencode, qwen, kilo, " +
+      "antigravity) and report " +
+      "which ones are actually installed on this machine, plus each available one's most recently updated " +
+      "session (if it supports session listing) so a prior conversation can be offered as a 'continue' option. " +
+      "Always call this before asking the user which CLI(s) to delegate to — don't assume a fixed set is " +
+      "installed.",
+    inputSchema: {},
+  },
+  async () => {
+    const results = await Promise.all(
+      Object.values(ADAPTERS).map(async (adapter) => {
+        const available = await adapter.checkAvailable();
+        if (!available) return { id: adapter.id, label: adapter.label, available: false };
+        const sessionsSupported = typeof adapter.listSessions === "function";
+        let mostRecentSession = null;
+        let sessionsWarning = null;
+        if (sessionsSupported) {
+          const { sessions, warning } = await adapter.listSessions(1);
+          mostRecentSession = sessions[0] ?? null;
+          sessionsWarning = warning;
+        }
+        return {
+          id: adapter.id,
+          label: adapter.label,
+          available: true,
+          permissions: adapter.permissions,
+          sessions_supported: sessionsSupported,
+          most_recent_session: mostRecentSession,
+          sessions_warning: sessionsWarning,
+        };
+      })
+    );
+    const payload = { ok: true, clis: results };
     return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
   }
 );
 
 server.registerTool(
-  "compare_agents",
+  "agent_delegate",
   {
-    title: "Get a second opinion from both Codex and OpenCode",
+    title: "Delegate a task to a CLI coding agent",
     description:
-      "Send the SAME prompt to both Codex and OpenCode concurrently and return both answers side by side, " +
-      "for a genuine second opinion or comparing how two backends approach the same problem. Always starts a " +
-      "fresh conversation on both sides (no session continuation, so there's no session_id/fork param) so the " +
-      "comparison stays fair and reproducible. Always runs Codex with sandbox 'read-only' and OpenCode with " +
-      "auto_approve off — there is deliberately no write-enabled variant of this tool, since running two " +
-      "independent agents with write access against the same files would race them against each other (this " +
-      "matters especially if cwd is a lane a 'lanes' split assigned exclusively to one worker — never point " +
-      "this tool at a lane's files expecting it to do that lane's actual edit; use codex_delegate directly for " +
-      "that). For a task that needs real edits, follow up with codex_delegate or opencode_delegate directly. " +
-      "Each side's result includes its own log_file (codex.log_file / opencode.log_file) with that call's " +
-      "raw live output, so both can be tailed side by side in separate terminals while they run.",
+      "Run the given CLI coding agent non-interactively on a task and return its final answer as text — call " +
+      "list_available_clis first to see which cli values are actually installed on this machine. Each CLI " +
+      "keeps its own conversation state: pass session_id (the session_id returned from a prior agent_delegate " +
+      "call to the SAME cli) to continue that exact conversation with full prior context, or set fork:true " +
+      "alongside it to branch a new session off that point instead of continuing in place. permission and cwd " +
+      "only take effect when starting a NEW session (no session_id) for CLIs whose resume mechanism doesn't " +
+      "accept them (e.g. Codex) — a continued session keeps whatever permission/cwd it was created with, and " +
+      "a warning is returned if this was silently dropped. permission defaults to that CLI's most restrictive " +
+      "option ('read-only' for both codex and opencode currently) — never escalate to a write-enabled or " +
+      "full-access permission unless the task genuinely requires editing files or the user explicitly asks for " +
+      "unsandboxed execution. The response includes log_file: a path this call's raw stdout/stderr was " +
+      "streamed to live as the CLI ran, so the user can tail it in another terminal " +
+      "(`Get-Content -Wait <path>` / `tail -f <path>`) to watch it happen in real time instead of waiting for " +
+      "the final result.",
     inputSchema: {
-      prompt: z.string().describe("The task or question to send to both Codex and OpenCode"),
-      cwd: z.string().optional().describe("Working directory both agents should read from"),
-      timeout_ms: z.number().optional().describe("Per-agent timeout. Default: 300000 (5 min)"),
+      cli: z.enum(Object.keys(ADAPTERS)).describe("Which CLI coding agent to delegate to"),
+      prompt: z.string().describe("The task or instructions to send"),
+      cwd: z.string().optional().describe("Working directory the agent should treat as its workspace root"),
+      permission: z
+        .string()
+        .optional()
+        .describe(
+          "Permission level for this run — accepted values vary per cli (codex: read-only/workspace-write/" +
+            "danger-full-access; opencode: read-only/workspace-write). Defaults to the most restrictive option."
+        ),
+      model: z.string().optional().describe("Override model, if the cli supports it"),
+      agent: z.string().optional().describe("Named sub-agent profile, if the cli supports it (opencode only)"),
+      session_id: z.string().optional().describe("session_id from a previous agent_delegate call to the SAME cli, to continue that conversation"),
+      fork: z.boolean().optional().describe("If session_id is set, fork into a new session instead of resuming in place. Default: false"),
+      timeout_ms: z.number().optional().describe("Kill the CLI if it runs longer than this. Default: 300000 (5 min)"),
     },
   },
-  async ({ prompt, cwd, timeout_ms }) => {
-    const [codex, opencode] = await Promise.all([
-      delegateToCodex({ prompt, cwd, sandbox: "read-only", timeoutMs: timeout_ms }),
-      delegateToOpencode({ message: prompt, cwd, autoApprove: false, timeoutMs: timeout_ms }),
-    ]);
-    const payload = { ok: codex.ok && opencode.ok, prompt, codex, opencode };
+  async ({ cli, prompt, cwd, permission, model, agent, session_id, fork, timeout_ms }) => {
+    const adapter = ADAPTERS[cli];
+    if (!adapter) {
+      const payload = { ok: false, spawn_error: `Unknown cli '${cli}'. Known: ${Object.keys(ADAPTERS).join(", ")}` };
+      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+    }
+    const payload = await delegateTo(adapter, { prompt, cwd, permission, model, agent, session_id, fork, timeoutMs: timeout_ms });
+    return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+  }
+);
+
+server.registerTool(
+  "agent_list_sessions",
+  {
+    title: "List sessions for a CLI coding agent",
+    description:
+      "List a CLI coding agent's existing sessions (id, title, timestamps), most recently updated first — " +
+      "including sessions created outside this plugin (e.g. from that CLI's own interactive use). Use this to " +
+      "find the right session_id for agent_delegate when it isn't already in this conversation (e.g. after " +
+      "compaction, or in a fresh conversation). Not every cli supports this — check sessions_supported from " +
+      "list_available_clis first, or check the ok field here.",
+    inputSchema: {
+      cli: z.enum(Object.keys(ADAPTERS)).describe("Which CLI coding agent's sessions to list"),
+      max_count: z.number().optional().describe("Max sessions to return. Default: 20"),
+    },
+  },
+  async ({ cli, max_count }) => {
+    const adapter = ADAPTERS[cli];
+    if (!adapter) {
+      const payload = { ok: false, sessions: [], count: 0, warning: `Unknown cli '${cli}'. Known: ${Object.keys(ADAPTERS).join(", ")}` };
+      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+    }
+    if (typeof adapter.listSessions !== "function") {
+      const payload = { ok: false, sessions: [], count: 0, warning: `${adapter.label} does not support non-interactive session listing.` };
+      return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
+    }
+    const { sessions, warning } = await adapter.listSessions(max_count ?? 20);
+    const payload = { ok: warning === null, sessions, count: sessions.length, warning };
     return { content: [{ type: "text", text: JSON.stringify(payload, null, 2) }] };
   }
 );
