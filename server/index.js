@@ -14,8 +14,44 @@ import path from "node:path";
 // for telling concurrent lanes' output apart.
 const LOG_DIR = path.join(os.tmpdir(), "agent-bridge-logs");
 
-// nano-spawn resolves .cmd/.bat shims on Windows internally (no shell:true
-// needed), so LLM-generated prompt text never gets re-parsed by cmd.exe.
+// A Windows .cmd batch shim (what npm generates for every globally-installed
+// CLI) is interpreted by cmd.exe's own batch processor, which reads its
+// command line one LINE at a time — a literal newline inside an argument
+// (a multi-paragraph prompt, near-guaranteed for any real task) silently
+// truncates everything after the first line, flags included, no matter how
+// nano-spawn quotes it. Found live: a multi-line prompt to Codex got cut to
+// its first line, --skip-git-repo-check and the rest vanished, and it
+// surfaced as an unrelated-looking "not inside a trusted directory" error.
+// A real .exe/node process's own argv parsing preserves embedded newlines
+// fine (verified) — only the batch-file hop is broken — so this resolves an
+// npm shim's actual `node <script>.js` target from its own source and
+// invokes that directly, bypassing cmd.exe entirely. Non-npm binaries (no
+// .cmd found, e.g. Antigravity's native installer) fall through unchanged.
+const shimCache = new Map();
+async function resolveWindowsCmdShim(command) {
+  if (process.platform !== "win32") return null;
+  if (shimCache.has(command)) return shimCache.get(command);
+
+  let resolved = null;
+  try {
+    const whereResult = await spawn("where", [command]);
+    const cmdPath = whereResult.stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .find((p) => p.toLowerCase().endsWith(".cmd"));
+    if (cmdPath) {
+      const content = await readFile(cmdPath, "utf8");
+      const match = content.match(/"%dp0%\\?([^"]+\.c?js)"/i);
+      if (match) resolved = { script: path.join(path.dirname(cmdPath), match[1]) };
+    }
+  } catch {
+    // where.exe failed or the shim doesn't match npm's usual pattern — fall
+    // back to spawning the original command unchanged.
+  }
+  shimCache.set(command, resolved);
+  return resolved;
+}
+
 async function runCli(command, args, { cwd, timeoutMs, logLabel } = {}) {
   const controller = new AbortController();
   let timedOut = false;
@@ -31,10 +67,14 @@ async function runCli(command, args, { cwd, timeoutMs, logLabel } = {}) {
   const logStream = createWriteStream(logFile, { flags: "a" });
   logStream.write(`$ ${command} ${args.join(" ")}\n${cwd ? `cwd: ${cwd}\n` : ""}\n`);
 
+  const shim = await resolveWindowsCmdShim(command);
+  if (shim) logStream.write(`(bypassing .cmd shim, invoking node "${shim.script}" directly)\n`);
+  const [spawnCommand, spawnArgs] = shim ? ["node", [shim.script, ...args]] : [command, args];
+
   // stdio: give the child an already-closed stdin. Several of these CLIs
   // (codex, opencode) block waiting for stdin EOF even when a prompt is
   // passed as an argument — closing stdin up front avoids that hang.
-  const subprocess = spawn(command, args, { cwd, signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
+  const subprocess = spawn(spawnCommand, spawnArgs, { cwd, signal: controller.signal, stdio: ["ignore", "pipe", "pipe"] });
 
   // Consuming subprocess.stdout/.stderr as async iterables drains them, so the
   // Result/SubprocessError's own .stdout/.stderr come back empty afterward —
@@ -417,12 +457,26 @@ async function delegateTo(adapter, { prompt, cwd, permission, model, agent, sess
   const result = await runCli(adapter.bin, args, { cwd, timeoutMs: effectiveTimeout, logLabel: adapter.id });
   const parsed = adapter.extractResult(result.stdout);
 
+  // A CLI can ignore its own --format/--output-format json flag under some
+  // conditions (observed live: opencode fell back to plain text with a
+  // free-tier model) and print an unparseable plain-text answer instead.
+  // parseJsonLines silently skips non-JSON lines, so zero JSON events parsed
+  // at all (not just zero with a text field) means the output likely wasn't
+  // JSON in the first place — fall back to the raw stdout as the answer
+  // rather than reporting a false empty/failed result.
+  let text = parsed.text;
+  const warningsOut = [...warnings, ...parsed.warnings];
+  if (!text && result.ok && result.stdout.trim() && parseJsonLines(result.stdout).length === 0) {
+    text = result.stdout.trim();
+    warningsOut.push(`${adapter.label}'s output wasn't valid JSON despite requesting it — falling back to raw stdout as the answer.`);
+  }
+
   return {
-    ok: result.ok && parsed.text.length > 0,
+    ok: result.ok && text.length > 0,
     cli: adapter.id,
     session_id: parsed.sessionId ?? session_id ?? null,
-    text: parsed.text,
-    warnings: [...warnings, ...parsed.warnings],
+    text,
+    warnings: warningsOut,
     usage: parsed.usage,
     permission: session_id ? null : permission ?? adapter.permissions[0],
     timed_out: result.timedOut,

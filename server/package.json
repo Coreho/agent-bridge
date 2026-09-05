@@ -2,7 +2,7 @@
   "name": "agent-bridge-server",
   "private": true,
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "nano-spawn": "^2.1.0",
