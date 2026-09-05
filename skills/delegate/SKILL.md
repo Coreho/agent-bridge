@@ -16,6 +16,8 @@ Call `list_available_clis`. This tells you which CLIs are actually installed on 
 
 Ask a multi-select AskUserQuestion: "Which workers would you like to delegate to?" with one option per CLI `list_available_clis` reported as `available: true`, plus one more option: "Include Claude (this session)". If `list_available_clis` found nothing installed, skip this question and proceed with Claude as the only worker.
 
+**AskUserQuestion allows at most 4 options per question.** If the available-CLI count plus the Claude option exceeds 4, split it into multiple sequential AskUserQuestion calls up front (e.g. "(1/2)"/"(2/2)" in the question text) rather than trying to fit them all in one call — don't find this out by hitting an error first.
+
 The set the user picks here — one or more CLIs, optionally plus Claude — is "the pool" for the rest of this flow. Every later step (session picks, Lanes assignment, Compare, Plain task) only ever uses workers from this pool.
 
 ## 3. Pick a session, per CLI in the pool
