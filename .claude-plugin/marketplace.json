@@ -1,0 +1,17 @@
+{
+  "name": "agent-bridge-marketplace",
+  "owner": {
+    "name": "Coreho"
+  },
+  "metadata": {
+    "description": "A marketplace hosting the agent-bridge plugin — delegate coding tasks to other locally-installed CLI coding agents (Codex, OpenCode, Qwen Code, Kilo Code, Antigravity) and to Claude itself.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "agent-bridge",
+      "source": "./",
+      "description": "Delegate coding tasks to other locally-installed CLI coding agents (Codex, OpenCode, Qwen Code, Kilo Code, Antigravity) and manage multi-turn sessions with them from inside Claude Code"
+    }
+  ]
+}
