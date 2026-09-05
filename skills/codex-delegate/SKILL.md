@@ -1,6 +1,6 @@
 ---
 name: codex-delegate
-description: Guided, menu-driven flow for delegating work to Codex CLI — pick an existing session (or start new), then choose how to delegate it (a plain task, a lanes-split parallel job, or a compare against OpenCode). Use when the user types /codex-delegate, or asks to delegate/hand off/send work to Codex through a menu rather than a one-off ask.
+description: Guided, menu-driven flow for delegating work — pick an existing Codex session (or start new), then choose how to delegate it (a plain task to Codex, a lanes-split job spread across Claude/Codex/OpenCode, or a compare against OpenCode). Use when the user types /codex-delegate, or asks to delegate/hand off/send work through a menu rather than a one-off ask.
 argument-hint: "[optional task description]"
 ---
 
@@ -20,10 +20,10 @@ If `codex_list_sessions` comes back empty, skip the question entirely and procee
 
 Ask a second AskUserQuestion: "What would you like to delegate?" with these options:
 - **Plain task (Recommended)** — send one task/prompt straight to Codex.
-- **Lanes** — split a larger backlog into non-overlapping lanes first, then delegate each lane to its own Codex thread in parallel.
+- **Lanes** — split a larger backlog into non-overlapping lanes first, then run every lane in parallel across whichever workers fit — you (Claude) directly, Codex, and/or OpenCode, mixed as needed.
 - **Compare** — send the same prompt to both Codex and OpenCode and show both answers side by side.
 
-Tell the user up front: **Compare always starts fresh on both backends** (the session from step 1 doesn't apply — a fair comparison needs both sides starting from nothing). **Lanes also starts one fresh Codex thread per lane** rather than reusing the step-1 session, since each lane needs to run independently. The step-1 session only carries into the Plain task branch.
+Tell the user up front: **Compare always starts fresh on both backends** (the session from step 1 doesn't apply — a fair comparison needs both sides starting from nothing). **Lanes assigns each lane to whichever worker fits it best and runs all of them in parallel** — this is genuine cross-tool orchestration, not a Codex-only fan-out: a lane can go to you directly with no delegation at all, or to Codex/OpenCode as a fresh thread. The step-1 session only carries into the Plain task branch; it has no bearing on Lanes or Compare.
 
 ## 3a. Plain task
 
@@ -31,7 +31,14 @@ If there's no task yet (not in `$ARGUMENTS`, not said in this conversation), ask
 
 ## 3b. Lanes
 
-Ask the user to describe the backlog to split, if it isn't already clear. Invoke the `lanes` skill on that description. For each lane it produces, call `codex_delegate` — these are independent calls with no dependency between them, so make them in parallel — with `sandbox: "workspace-write"`, `cwd` set to that lane's scope, and no `session_id` (fresh thread per lane, since lanes only guarantees no file overlap between *different* lanes, not between one thread's own multiple tasks). Report back grouped by lane: lane name, a summary of what Codex did, and that lane's `session_id` for any follow-up.
+Ask the user to describe the backlog to split, if it isn't already clear. Invoke the `lanes` skill on that description. For each lane it produces, decide which worker should run it — **yourself** (edit the files directly with your own tools, no delegation at all), **`codex_delegate`**, or **`opencode_delegate`** — using judgment: a lane that's simple and benefits from the context you already have in this conversation is a good fit to keep for yourself; a lane you want a different model's take on, or want to genuinely run off your own attention in parallel, goes to Codex or OpenCode. State the lane → worker assignment to the user before running, so they can redirect it if you got it wrong.
+
+Then run every lane at once, in parallel, regardless of which worker it went to — don't wait for delegated lanes to finish before starting your own, and don't wait for one delegated lane before starting another:
+- **Your own lane(s)**: just do the work directly with your normal tools.
+- **Codex lanes**: `codex_delegate` with `sandbox: "workspace-write"`, `cwd` set to that lane's scope, no `session_id` (fresh thread per lane — lanes only guarantees no file overlap between *different* lanes, not shared context across calls).
+- **OpenCode lanes**: `opencode_delegate` with `auto_approve: true` (non-interactive — it needs write access and there's no one to approve a permission prompt), `cwd` set to that lane's scope, no `session_id`.
+
+Report back grouped by lane: lane name, which worker handled it, a summary of what happened, and — for delegated lanes — the `session_id` (for follow-up) and `log_file` (so the user can tail it live or after the fact).
 
 ## 3c. Compare
 
